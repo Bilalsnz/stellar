@@ -1,0 +1,247 @@
+@import "tailwindcss";
+
+/*
+  HoldPay is graded, not themed. One grade runs through the whole page:
+  amber into copper. The wash, the rate and the pay button all draw from it,
+  and nothing else in the UI introduces a second colour.
+
+  The paid state swaps that same wash to a muted olive, so a settled page is
+  recognisable at a glance from an unpaid one.
+*/
+:root {
+  /* The grade, defined once. Everything below derives from these three. */
+  --amber-rgb: 232 161 90;
+  --copper-rgb: 184 92 56;
+  --olive-rgb: 125 143 106;
+}
+
+@theme {
+  --color-paper: #f4efe6;
+  --color-ink: #1c1915;
+  --color-card: #fbf8f2;
+  --color-line: #e3d9c8;
+
+  --color-amber: rgb(var(--amber-rgb));
+  --color-copper: rgb(var(--copper-rgb));
+  --color-olive: rgb(var(--olive-rgb));
+}
+
+:root {
+  /* The amber, deepened only as far as legible text needs. Derived from the
+     grade rather than picked separately, so it can never drift out of family. */
+  --amber-text: #b8722f;
+  --amber-text: color-mix(in srgb, var(--color-amber) 72%, var(--color-ink));
+
+  --ink-muted: rgba(28, 25, 21, 0.58);
+  --ink-faint: rgba(28, 25, 21, 0.38);
+  --shadow-card: 0 1px 2px rgba(28, 25, 21, 0.04), 0 10px 28px rgba(28, 25, 21, 0.05);
+
+  /* The grade, as the wash uses it. Swapped wholesale by [data-paid]. */
+  --wash-amber: var(--amber-rgb);
+  --wash-copper: var(--copper-rgb);
+}
+
+[data-paid="true"] {
+  --wash-amber: var(--olive-rgb);
+  --wash-copper: var(--olive-rgb);
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  background-color: var(--color-paper);
+  color: var(--color-ink);
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial,
+    sans-serif;
+  letter-spacing: -0.011em;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/*
+  The soft top wash. Light falling from above, never a glow: it fades to
+  nothing well before it reaches the first card.
+*/
+.wash {
+  position: fixed;
+  inset: 0 0 auto 0;
+  height: 46vh;
+  pointer-events: none;
+  z-index: 0;
+  background:
+    radial-gradient(
+      90% 100% at 50% -30%,
+      rgb(var(--wash-amber) / 0.62) 0%,
+      rgb(var(--wash-amber) / 0.22) 45%,
+      rgb(var(--wash-amber) / 0) 78%
+    ),
+    linear-gradient(180deg, rgb(var(--wash-copper) / 0.16) 0%, rgb(var(--wash-copper) / 0) 62%);
+  transition: background 600ms ease;
+}
+
+.card {
+  background-color: var(--color-card);
+  border: 1px solid var(--color-line);
+  border-radius: 14px;
+  box-shadow: var(--shadow-card);
+}
+
+/* Big price, small note. */
+.price {
+  font-size: clamp(3rem, 16vw, 4.25rem);
+  line-height: 0.95;
+  font-weight: 600;
+  letter-spacing: -0.035em;
+  font-variant-numeric: tabular-nums;
+}
+
+.price-unit {
+  font-size: 0.28em;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: var(--ink-muted);
+  margin-left: 0.5em;
+  vertical-align: 0.42em;
+}
+
+/* The rate carries the grade as text, so it stays legible on paper. */
+.rate {
+  background-image: linear-gradient(96deg, var(--amber-text) 0%, var(--color-copper) 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
+}
+
+/*
+  The pay button. The amber sits as light on top of copper rather than as a
+  light-to-dark ramp, so the label keeps its contrast the whole way across.
+*/
+.pay-button {
+  background-image:
+    linear-gradient(180deg, rgb(var(--wash-amber) / 0.5) 0%, rgb(var(--wash-amber) / 0) 52%),
+    linear-gradient(180deg, #bd6039 0%, #a94f2c 100%);
+  color: #fdf8f0;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  border: 1px solid rgba(28, 25, 21, 0.14);
+  box-shadow: 0 1px 2px rgba(28, 25, 21, 0.12), 0 8px 20px rgba(184, 92, 56, 0.24);
+  transition: transform 120ms ease, box-shadow 160ms ease, filter 160ms ease;
+}
+
+.pay-button:hover:not(:disabled) {
+  filter: brightness(1.04);
+  box-shadow: 0 1px 2px rgba(28, 25, 21, 0.14), 0 10px 24px rgba(184, 92, 56, 0.3);
+}
+
+.pay-button:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+.pay-button:disabled {
+  opacity: 0.45;
+  box-shadow: none;
+  cursor: not-allowed;
+}
+
+[data-paid="true"] .pay-button {
+  background-image:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.2) 0%, rgba(255, 255, 255, 0) 52%),
+    linear-gradient(180deg, #8a9c76 0%, #6f8060 100%);
+  box-shadow: 0 1px 2px rgba(28, 25, 21, 0.12), 0 8px 20px rgba(125, 143, 106, 0.24);
+}
+
+.field {
+  background-color: rgba(255, 255, 255, 0.55);
+  border: 1px solid var(--color-line);
+  border-radius: 10px;
+  color: var(--color-ink);
+  transition: border-color 140ms ease, background-color 140ms ease;
+}
+
+.field::placeholder {
+  color: var(--ink-faint);
+}
+
+.field:focus {
+  outline: none;
+  border-color: rgba(184, 92, 56, 0.55);
+  background-color: rgba(255, 255, 255, 0.8);
+}
+
+.wallet-button {
+  background-color: rgba(255, 255, 255, 0.6);
+  border: 1px solid var(--color-line);
+  border-radius: 10px;
+  transition: border-color 140ms ease, background-color 140ms ease, transform 120ms ease;
+}
+
+.wallet-button:hover:not(:disabled) {
+  border-color: rgba(184, 92, 56, 0.45);
+  background-color: rgba(255, 255, 255, 0.85);
+}
+
+.wallet-button:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+.wallet-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* The chosen asset, warmed by the grade. */
+.wallet-button[aria-pressed="true"] {
+  border-color: rgb(var(--copper-rgb) / 0.6);
+  background-color: rgb(var(--amber-rgb) / 0.13);
+}
+
+/* An asset with no route is stated plainly — no new colour, no fake number. */
+.no-path {
+  border: 1px dashed rgba(28, 25, 21, 0.2);
+  border-radius: 10px;
+  color: var(--ink-muted);
+}
+
+.rule {
+  height: 1px;
+  background: linear-gradient(
+    90deg,
+    rgba(28, 25, 21, 0.14) 0%,
+    rgba(28, 25, 21, 0.06) 60%,
+    rgba(28, 25, 21, 0) 100%
+  );
+}
+
+.mono {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  letter-spacing: -0.01em;
+}
+
+.fade-in {
+  animation: fade-in 320ms ease both;
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
