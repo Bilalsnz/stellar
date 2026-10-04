@@ -6,6 +6,7 @@ import { ReceiveStatus } from "@/components/receive-status";
 import { formatAmount, formatUsdc, formatWhen } from "@/lib/format";
 import {
   MAX_NOTE_LENGTH,
+  buildClaimLink,
   buildClaimPath,
   buildPayLink,
   buildPayPathFromEncoded,
@@ -346,8 +347,9 @@ export default function HomePage() {
               </a>
 
               <p className="mt-2 text-[11.5px] leading-relaxed text-[var(--ink-faint)]">
-                The claim id is made by your client&rsquo;s payment, not by this link — it appears on
-                your locks below the moment they pay.
+                The claim id is made by your client&rsquo;s payment, not by this link — a lock cannot
+                exist before there is money to lock. The moment they pay it appears below, and that
+                is the link that carries the claim id.
               </p>
             </section>
           )}
@@ -364,31 +366,59 @@ export default function HomePage() {
                 </p>
               ) : (
                 <ul className="mt-3 space-y-2">
-                  {locks.map((entry) => (
-                    <li key={entry.id} className="card flex items-center gap-3 px-3.5 py-3">
-                      <div className="min-w-0 flex-1">
-                        <p className="text-[15px] font-semibold tabular-nums">
-                          {formatAmount(entry.state.amount ?? 0)}
-                          <span className="ml-1.5 text-[11px] font-semibold tracking-[0.06em] text-[var(--ink-muted)]">
-                            USDC
-                          </span>
-                        </p>
-                        <p className="mt-0.5 text-[12px] text-[var(--ink-muted)]">
-                          {entry.state.deadline
-                            ? `Claim by ${formatWhen(entry.state.deadline * 1000)}`
-                            : "Waiting to be claimed"}
-                          {entry.state.funder ? ` · from ${shortAddress(entry.state.funder, 4, 4)}` : ""}
-                        </p>
-                      </div>
+                  {locks.map((entry) => {
+                    const claimLink = buildClaimLink(
+                      typeof window === "undefined" ? "" : window.location.origin,
+                      entry.id,
+                    );
+                    return (
+                      <li key={entry.id} className="card px-3.5 py-3">
+                        <div className="flex items-center gap-3">
+                          <div className="min-w-0 flex-1">
+                            <p className="text-[15px] font-semibold tabular-nums">
+                              {formatAmount(entry.state.amount ?? 0)}
+                              <span className="ml-1.5 text-[11px] font-semibold tracking-[0.06em] text-[var(--ink-muted)]">
+                                USDC
+                              </span>
+                            </p>
+                            <p className="mt-0.5 text-[12px] text-[var(--ink-muted)]">
+                              {entry.state.deadline
+                                ? `Claim by ${formatWhen(entry.state.deadline * 1000)}`
+                                : "Waiting to be claimed"}
+                              {entry.state.funder
+                                ? ` · from ${shortAddress(entry.state.funder, 4, 4)}`
+                                : ""}
+                            </p>
+                          </div>
 
-                      <a
-                        href={buildClaimPath(entry.id)}
-                        className="wallet-button shrink-0 px-3 py-1.5 text-[11.5px] font-semibold"
-                      >
-                        Claim
-                      </a>
-                    </li>
-                  ))}
+                          <a
+                            href={buildClaimPath(entry.id)}
+                            className="wallet-button shrink-0 px-3 py-1.5 text-[11.5px] font-semibold"
+                          >
+                            Claim
+                          </a>
+                        </div>
+
+                        {/* The claim id only exists once someone has paid, so this is
+                            the link that carries it — ready to hand to the client. */}
+                        <div className="mt-2.5 flex items-stretch gap-2">
+                          <input
+                            readOnly
+                            value={claimLink}
+                            onFocus={(event) => event.currentTarget.select()}
+                            className="field mono min-w-0 flex-1 px-2.5 py-1.5 text-[10.5px]"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => void copy(claimLink, `claim-${entry.id}`)}
+                            className="wallet-button shrink-0 px-2.5 py-1.5 text-[11px] font-semibold"
+                          >
+                            {copied === `claim-${entry.id}` ? "Copied" : "Copy"}
+                          </button>
+                        </div>
+                      </li>
+                    );
+                  })}
                 </ul>
               )}
             </section>

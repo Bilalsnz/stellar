@@ -109,7 +109,8 @@ async function lobstr() {
 /**
  * Freighter's mobile app runs dapps in its own browser, but it injects only a
  * marker saying who it is — not the extension API. A page there can detect the
- * situation and say something true, but it cannot sign.
+ * situation and say something true, but it cannot sign. The mobile signing path
+ * Freighter supports is WalletConnect; see `probeWallet`.
  */
 function inFreighterApp(): boolean {
   if (typeof window === "undefined") return false;
@@ -117,9 +118,17 @@ function inFreighterApp(): boolean {
   return injected?.provider === "freighter" && injected?.platform === "mobile";
 }
 
-function hasFreighterExtension(): boolean {
+/**
+ * Freighter's injected provider is `window.freighterApi`; `window.freighter` is
+ * the legacy alias, and other wallets' in-app browsers inject that same
+ * Freighter interface. Checking only the legacy name would report a working
+ * sign path as missing — and a button that cannot connect is exactly what this
+ * file exists to avoid, in both directions.
+ */
+function hasFreighterApi(): boolean {
   if (typeof window === "undefined") return false;
-  return Boolean((window as { freighter?: unknown }).freighter);
+  const injected = window as { freighterApi?: unknown; freighter?: unknown };
+  return Boolean(injected.freighterApi ?? injected.freighter);
 }
 
 function hasLobstrExtension(): boolean {
@@ -132,27 +141,25 @@ export function walletName(id: WalletId): string {
 }
 
 /**
- * Ask each wallet where it stands. Freighter is answered outright when it is
- * installed; LOBSTR's `isConnected` is asked only because it is the one call
- * that reliably gives up on its own, and it is bounded here regardless.
+ * Ask each wallet where it stands. Everything here is bounded, so this settles
+ * within the detection ceiling no matter what the page is running inside.
+ *
+ * The order matters: a real injected provider is checked *first*, and the
+ * Freighter-mobile marker only decides the message once no provider was found.
+ * That way a wallet browser which does inject the API stays usable, and one
+ * that only announces itself is reported honestly instead of being probed and
+ * left to hang.
  */
 export async function probeWallet(id: WalletId): Promise<WalletProbe> {
   const name = walletName(id);
-
-  if (id === "freighter" && inFreighterApp()) {
-    return {
-      id,
-      name,
-      usable: false,
-      detail: "You are in the Freighter app, which cannot sign for a web page. Open this link in Safari or Chrome.",
-    };
-  }
-
   let usable = false;
+
   try {
     if (id === "freighter") {
-      usable = hasFreighterExtension();
+      usable = hasFreighterApi();
       if (!usable) {
+        // No injected object, so ask the SDK anyway — it reads the same global,
+        // and `isConnected` is the one call that gives up on its own.
         const api = await freighter();
         const result = await withTimeout(api.isConnected(), DETECT_TIMEOUT_MS, "no answer");
         usable = Boolean(result?.isConnected);
@@ -168,11 +175,21 @@ export async function probeWallet(id: WalletId): Promise<WalletProbe> {
     usable = false;
   }
 
+  if (!usable && id === "freighter" && inFreighterApp()) {
+    return {
+      id,
+      name,
+      usable: false,
+      detail:
+        "You are in the Freighter app, which cannot sign for a web page. Open this link in Safari or Chrome on a computer — Freighter signs for web pages over WalletConnect, which this page does not have.",
+    };
+  }
+
   return {
     id,
     name,
     usable,
-    detail: usable ? "Browser extension" : "Not installed in this browser",
+    detail: usable ? "Ready to sign in this browser" : "Not installed in this browser",
   };
 }
 
@@ -187,7 +204,7 @@ export async function probeAll(): Promise<WalletProbe[]> {
  * either way, so a late injection cannot turn into a hang.
  */
 function assertReachable(id: WalletId): void {
-  if (id === "freighter" && inFreighterApp()) {
+  if (id === "freighter" && !hasFreighterApi() && inFreighterApp()) {
     throw new Error(
       "The Freighter app cannot sign for a web page. Open this link in Safari or Chrome, where the Freighter extension can.",
     );

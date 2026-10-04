@@ -48,9 +48,27 @@ for both, and the ledger enforces the deadline rather than the page.
 
 **The lock is funded by the client, and it has to be.** A claimable balance is
 paid for out of its creator's own balance, and a freelancer setting up a link
-holds no USDC — often not even a trustline. Naming a claimant costs nothing,
-which is exactly why an account that cannot yet receive USDC can still be paid
-this way. The freelancer adds the trustline at the moment they claim.
+holds no USDC — often not even a trustline. This is not a design preference; it
+is what the ledger does, and `scripts/probe-freelancer-lock.mjs` shows the error
+codes:
+
+| who tries to lock 5 USDC | result |
+| --- | --- |
+| the freelancer, no trustline | `op_no_trust` |
+| the freelancer, trustline but 0 USDC | `op_underfunded` |
+| the same freelancer, locking **XLM** it does hold | succeeds |
+| the client, trustline but 0 USDC | `op_underfunded` |
+
+The third row is the point: nothing is wrong with the freelancer's account — it
+simply does not hold the asset being locked. Naming a claimant costs nothing,
+which is why an account that cannot yet receive USDC can still be paid this way.
+The freelancer adds the trustline at the moment they claim.
+
+A consequence worth stating plainly: the **claim id cannot exist when the link is
+created**, because it describes a balance that does not exist until someone pays.
+It is derived from the client's transaction. The freelancer's page lists every
+lock standing for their address and gives them the link that carries the claim
+id the moment one does.
 
 ### No database
 
@@ -105,20 +123,32 @@ call — the one that connects — hangs for good. That is what an endless
 gives up after 2 seconds, connecting after 30, signing after 90, and each ceiling
 becomes a sentence rather than a spinner.
 
-**Inside the Freighter app on a phone**, the page is running in the wallet's own
-browser, where the extension API is not injected — Freighter only sets
-`window.stellar = { provider: "freighter", platform: "mobile" }`. That is
-detectable, so the page detects it and says plainly that the app cannot sign for
-a web page and the link should be opened in Safari or Chrome. The trustline step
-is gated the same way, so it too fails with a sentence instead of hanging.
+**The injected provider is `window.freighterApi`**, with `window.freighter` as a
+legacy alias. Other wallets' in-app browsers (D'CENT, and the mobile browsers
+Stellar Wallets Kit probes for) inject that same Freighter interface, so a page
+that checks only the legacy name reports a working sign path as missing. HoldPay
+checks for the provider **first**, and only falls through to the mobile message
+when no provider answered — so a wallet browser that does inject the API stays
+usable.
 
-LOBSTR's in-app browser injects no documented API at all, so there is nothing to
-detect and nothing to call; the page reports that no sign path is reachable here.
+**Inside the Freighter app on a phone**, no extension API is injected at all —
+Freighter sets only `window.stellar = { provider: "freighter", platform:
+"mobile" }`. That is detectable, so the page detects it and says plainly that the
+app cannot sign for a web page and the link should be opened in a browser where
+Freighter can sign. The trustline step is gated the same way, so it too fails
+with a sentence instead of hanging.
 
-Neither wallet offers an in-app-browser signing API. The path that does work on a
-phone is WalletConnect, which needs a Reown/WalletConnect project id — a
-credential this app does not have. Rather than ship a button that spins forever,
-HoldPay ships the bounded timeouts and says what it cannot do.
+LOBSTR's in-app browser injects no documented API, so there is nothing to detect
+and nothing to call. Their signing flow runs through the *desktop* extension with
+confirmation pushed to the phone app. The page reports that no sign path is
+reachable here rather than offering a button that cannot work.
+
+**Neither wallet offers an in-app-browser signing API.** Freighter's own docs
+state that mobile integration "works over WalletConnect v2" (`stellar_signXDR`,
+`stellar_signAndSubmitXDR`). Implementing that needs a Reown/WalletConnect
+project id, and its kit pulls in Reown, Trezor and Ledger — so rather than ship
+an untestable path that would also risk the deploy, HoldPay ships the bounded
+timeouts and says exactly what it cannot do.
 
 Both wallets must be set to **Testnet**. Freighter's network is read and a
 warning is shown when it is pointed elsewhere. LOBSTR exposes no network query,
@@ -159,7 +189,15 @@ It checks, among other things, that:
 
 Last run, all 28 checks passed. The three transactions it produced are on the
 landing page under "A worked example, on testnet", and are kept in
-`lib/proof.ts`. 5.00 USDC cost 5.2900451 XLM (1 USDC = 1.0580 XLM).
+`lib/proof.ts`. 5.00 USDC cost 5.2901203 XLM (1 USDC = 1.0580 XLM).
+
+`scripts/probe-freelancer-lock.mjs` is the companion piece: it asks the network
+directly who is able to fund a lock, and prints the error code for each
+candidate. Its results are the table in **The lock** above.
+
+```bash
+node scripts/probe-freelancer-lock.mjs
+```
 
 ## Receiving USDC
 
