@@ -5,6 +5,10 @@ import { useSearchParams } from "next/navigation";
 import {
   EXPLORER_URL,
   FRIENDBOT_URL,
+  USDC,
+  assetKey,
+  buildClaim,
+  buildLockedPayment,
   buildPathPayment,
   checkDestination,
   explainSubmitError,
@@ -12,6 +16,7 @@ import {
   nextSequence,
   quoteAll,
   readLandedPayment,
+  readLock,
   shortAddress,
   submitSignedXdr,
   toStellarAmount,
@@ -19,32 +24,58 @@ import {
   type DestinationCheck,
   type HeldAsset,
   type LandedPayment,
+  type LockState,
   type Quote,
 } from "@/lib/stellar";
 import { decodeRequest, type PayRequest } from "@/lib/link";
-import { formatAmount, formatRate, formatUsdc } from "@/lib/format";
+import { formatAmount, formatRate, formatUsdc, formatWhen } from "@/lib/format";
 import {
-  WALLETS,
   connect,
-  isAvailable,
+  probeAll,
   sign,
   walletName,
   type Connection,
   type WalletId,
+  type WalletProbe,
 } from "@/lib/wallet";
 
-type Phase = "choose-wallet" | "loading" | "ready" | "signing" | "submitting" | "paid";
+/** How long a fresh lock stays open when the link did not say. */
+const DEFAULT_DEADLINE_DAYS = 7;
+
+type Phase = "choose-wallet" | "loading" | "ready" | "signing" | "submitting" | "locked";
 
 type Connected = Connection & { wallet: WalletId };
 
+const USDC_KEY = assetKey(USDC);
+
+function defaultDeadline(): number {
+  return Math.floor(Date.now() / 1000) + DEFAULT_DEADLINE_DAYS * 86_400;
+}
+
+/**
+ * Horizon ingests a ledger a moment after it closes, so the lock can be real and
+ * still not be readable yet. Give it a few tries rather than showing "not on the
+ * ledger" to someone who just paid.
+ */
+async function readLockSettled(claimId: string, tries = 5): Promise<LockState> {
+  let state = await readLock(claimId);
+  for (let attempt = 1; attempt < tries && state.amount === null; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 900));
+    state = await readLock(claimId);
+  }
+  return state;
+}
+
 export function PayView() {
   const params = useSearchParams();
-  const request = useMemo<PayRequest | null>(
-    () => decodeRequest(params.get("d")),
-    [params],
-  );
+  const linked = useMemo(() => decodeRequest(params.get("d")), [params]);
+  const claimParam = params.get("c");
 
-  const [available, setAvailable] = useState<Record<string, boolean> | null>(null);
+  const [request, setRequest] = useState<PayRequest | null>(null);
+  const [resolving, setResolving] = useState(false);
+  const [resolveError, setResolveError] = useState<string | null>(null);
+
+  const [probes, setProbes] = useState<WalletProbe[] | null>(null);
   const [busyWallet, setBusyWallet] = useState<WalletId | null>(null);
   const [connection, setConnection] = useState<Connected | null>(null);
   const [account, setAccount] = useState<AccountState | null>(null);
@@ -56,21 +87,74 @@ export function PayView() {
   const [missingAccount, setMissingAccount] = useState(false);
   const [destCheck, setDestCheck] = useState<DestinationCheck | null>(null);
 
+  const [claimId, setClaimId] = useState<string | null>(null);
+  const [lock, setLock] = useState<LockState | null>(null);
+  const [lockBusy, setLockBusy] = useState(false);
+  const [lockError, setLockError] = useState<string | null>(null);
+
   const destAmount = request ? Number(request.amount) : 0;
 
-  // Which wallets are actually installed. We never show a button that cannot work.
+  // A link carries its own request. A claim id carries nothing, so the lock is
+  // read straight off the ledger to find out what it is for and who it pays.
+  useEffect(() => {
+    if (linked) {
+      setRequest(linked);
+      setResolving(false);
+      setResolveError(null);
+      return;
+    }
+    if (!claimParam) {
+      setRequest(null);
+      return;
+    }
+
+    let cancelled = false;
+    setResolving(true);
+    setResolveError(null);
+    void (async () => {
+      const state = await readLockSettled(claimParam, 2);
+      if (cancelled) return;
+      if (state.amount === null || !state.destination) {
+        setResolveError("That claim id is not on the Stellar testnet ledger.");
+      } else {
+        setRequest({
+          to: state.destination,
+          amount: String(state.amount),
+          note: "",
+          ts: 0,
+          ...(state.deadline ? { dead: state.deadline } : {}),
+        });
+        setClaimId(claimParam);
+        setLock(state);
+      }
+      setResolving(false);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [linked, claimParam]);
+
+  // Which wallets can actually answer here. Bounded, so this always settles.
   useEffect(() => {
     let cancelled = false;
     void (async () => {
-      const entries = await Promise.all(
-        WALLETS.map(async (wallet) => [wallet.id, await isAvailable(wallet.id)] as const),
-      );
-      if (!cancelled) setAvailable(Object.fromEntries(entries));
+      const next = await probeAll();
+      if (!cancelled) setProbes(next);
     })();
     return () => {
       cancelled = true;
     };
   }, []);
+
+  // Paid moves the wash from amber to olive.
+  useEffect(() => {
+    const root = document.documentElement;
+    if (lock?.status === "paid") root.dataset.paid = "true";
+    else delete root.dataset.paid;
+    return () => {
+      delete root.dataset.paid;
+    };
+  }, [lock]);
 
   // Can the address in this link receive USDC at all? Better to say so up front.
   const recheckDestination = useCallback(async () => {
@@ -83,19 +167,9 @@ export function PayView() {
     void recheckDestination();
   }, [recheckDestination]);
 
-  // The paid state moves the whole page's wash from amber to olive.
-  useEffect(() => {
-    const root = document.documentElement;
-    if (phase === "paid") root.dataset.paid = "true";
-    else delete root.dataset.paid;
-    return () => {
-      delete root.dataset.paid;
-    };
-  }, [phase]);
-
   // Once a wallet is connected, read what it holds and price every route.
   useEffect(() => {
-    if (!connection || !request) return;
+    if (!connection || !request || claimId) return;
     let cancelled = false;
 
     void (async () => {
@@ -132,7 +206,7 @@ export function PayView() {
     return () => {
       cancelled = true;
     };
-  }, [connection, request, destAmount]);
+  }, [connection, request, destAmount, claimId]);
 
   const connectWallet = useCallback(async (wallet: WalletId) => {
     setBusyWallet(wallet);
@@ -185,17 +259,49 @@ export function PayView() {
         return;
       }
 
+      const sendMax = toStellarAmount(Math.min(quote.sendMax, held.spendable));
+      const dest = toStellarAmount(destAmount);
+      const deadline = request.dead ?? defaultDeadline();
+
       setPhase("signing");
       const sequence = await nextSequence(connection.address);
-      const transaction = buildPathPayment(
+
+      // A lock names the freelancer and the client as claimants, and the ledger
+      // rejects a balance claimed twice by the same account. Someone paying
+      // their own link is the one case where there is nothing to lock.
+      const selfPay = request.to === connection.address;
+      if (selfPay) {
+        const transaction = buildPathPayment(
+          {
+            sourceAddress: connection.address,
+            destination: request.to,
+            sendAsset: held.asset,
+            sendMax,
+            destAmount: dest,
+            path: quote.path,
+          },
+          sequence,
+        );
+        const signed = await sign(connection.wallet, transaction.toXDR());
+        setPhase("submitting");
+        const result = await submitSignedXdr(signed);
+        setLanded(await readLandedPayment(result.hash));
+        setPhase("locked");
+        return;
+      }
+
+      const { transaction, claimId: id } = buildLockedPayment(
         {
           sourceAddress: connection.address,
           destination: request.to,
           sendAsset: held.asset,
-          // Never authorise more than the wallet can actually spend.
-          sendMax: toStellarAmount(Math.min(quote.sendMax, held.spendable)),
-          destAmount: toStellarAmount(destAmount),
+          sendMax,
+          destAmount: dest,
           path: quote.path,
+          deadline,
+          // The swap credits the client with USDC for the instant before it is
+          // locked, so the client needs the trustline — not only the freelancer.
+          addTrustline: !account.hasUsdc,
         },
         sequence,
       );
@@ -203,19 +309,78 @@ export function PayView() {
       const signed = await sign(connection.wallet, transaction.toXDR());
 
       setPhase("submitting");
-      const result = await submitSignedXdr(signed);
+      await submitSignedXdr(signed);
 
-      // The receipt is read back off the ledger, not assumed from the request.
-      const record = await readLandedPayment(result.hash);
-      setLanded(record);
-      setPhase("paid");
+      // The claim id is derived from the transaction, so it was already known;
+      // the state of the lock is then read back off the ledger.
+      setClaimId(id);
+      setLock(await readLockSettled(id));
+      setPhase("locked");
     } catch (payError) {
       setError(explainSubmitError(payError));
-      // The rate may have moved while the wallet was open; show where it stands now.
+      // The rate may have moved while the wallet was open; show where it stands.
       await refreshQuotes().catch(() => undefined);
       setPhase("ready");
     }
   }, [connection, account, request, selected, destAmount, refreshQuotes]);
+
+  /** Take the lock: the freelancer being paid, or the client taking it back. */
+  const takeLock = useCallback(async () => {
+    if (!connection || !claimId) return;
+    setLockBusy(true);
+    setLockError(null);
+    try {
+      const sequence = await nextSequence(connection.address);
+      const transaction = buildClaim(claimId, connection.address, sequence);
+      const signed = await sign(connection.wallet, transaction.toXDR());
+      await submitSignedXdr(signed);
+      setLock(await readLockSettled(claimId));
+    } catch (claimFailure) {
+      setLockError(explainSubmitError(claimFailure));
+    } finally {
+      setLockBusy(false);
+    }
+  }, [connection, claimId]);
+
+  const refreshLock = useCallback(async () => {
+    if (!claimId) return;
+    setLockBusy(true);
+    setLockError(null);
+    try {
+      setLock(await readLock(claimId));
+    } finally {
+      setLockBusy(false);
+    }
+  }, [claimId]);
+
+  if (resolving) {
+    return (
+      <Shell>
+        <p className="mt-9 text-[14px] text-[var(--ink-muted)]">Reading that claim…</p>
+      </Shell>
+    );
+  }
+
+  if (resolveError) {
+    return (
+      <Shell>
+        <div className="mt-9">
+          <h1 className="text-[1.6rem] font-semibold leading-tight tracking-[-0.03em]">
+            No such claim.
+          </h1>
+          <p className="mt-2.5 text-[14.5px] leading-relaxed text-[var(--ink-muted)]">
+            {resolveError} Check the id, or ask for the link again.
+          </p>
+          <a
+            href="/"
+            className="mt-5 inline-block text-[13px] font-semibold text-[var(--color-copper)] underline decoration-[rgba(184,92,56,0.35)] underline-offset-2"
+          >
+            Start again →
+          </a>
+        </div>
+      </Shell>
+    );
+  }
 
   if (!request) {
     return (
@@ -235,6 +400,29 @@ export function PayView() {
             Create a payment link →
           </a>
         </div>
+      </Shell>
+    );
+  }
+
+  // Once the lock exists, the page has exactly three things to say about it.
+  // A self-payment never made a lock, so it falls through to the receipt.
+  if (claimId && lock) {
+    return (
+      <Shell>
+        <LockView
+          lock={lock}
+          request={request}
+          claimId={claimId}
+          destAmount={destAmount}
+          connection={connection}
+          probes={probes}
+          busyWallet={busyWallet}
+          onConnect={connectWallet}
+          onTake={takeLock}
+          onRefresh={refreshLock}
+          busy={lockBusy}
+          error={lockError}
+        />
       </Shell>
     );
   }
@@ -269,11 +457,13 @@ export function PayView() {
     selectedQuote !== null &&
     selectedHeld.spendable >= selectedQuote.sourceAmount;
 
+  const deadline = request.dead ?? null;
+
   return (
     <Shell>
       <section className="mt-10">
         <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-[var(--ink-muted)]">
-          {phase === "paid" ? "Paid" : "Pay"}
+          {landed ? "Paid" : "Pay"}
         </p>
 
         <div className="price mt-2.5">
@@ -290,9 +480,15 @@ export function PayView() {
         <p className="mono mt-3 text-[11.5px] text-[var(--ink-faint)]">
           to {shortAddress(request.to, 8, 8)}
         </p>
+
+        {deadline && (
+          <p className="mt-1 text-[11.5px] text-[var(--ink-faint)]">
+            Held for them until {formatWhen(deadline * 1000)}.
+          </p>
+        )}
       </section>
 
-      {phase === "paid" && landed ? (
+      {landed ? (
         <PaidCard landed={landed} request={request} destAmount={destAmount} />
       ) : (
         <section className="card mt-7 p-4">
@@ -316,13 +512,12 @@ export function PayView() {
               quotes={quotes}
               selected={selected}
               onSelect={setSelected}
-              phase={phase}
               missingAccount={missingAccount}
               destAmount={destAmount}
             />
           ) : (
             <WalletChooser
-              available={available}
+              probes={probes}
               busyWallet={busyWallet}
               onConnect={connectWallet}
             />
@@ -339,9 +534,7 @@ export function PayView() {
               {selectedQuote && selectedHeld ? (
                 <>
                   <div className="flex items-baseline justify-between gap-3">
-                    <span className="text-[12.5px] text-[var(--ink-muted)]">
-                      You spend
-                    </span>
+                    <span className="text-[12.5px] text-[var(--ink-muted)]">You spend</span>
                     <span className="text-[13.5px] font-semibold tabular-nums">
                       {formatAmount(selectedQuote.sourceAmount)} {selectedHeld.code}
                     </span>
@@ -386,8 +579,8 @@ export function PayView() {
       )}
 
       <p className="mt-5 text-[11.5px] leading-relaxed text-[var(--ink-faint)]">
-        Stellar testnet. One transaction swaps and pays at once — the rate is quoted live from the
-        network and the price never changes.
+        Stellar testnet. One transaction swaps your asset into USDC and locks it for the payee —
+        the rate is quoted live from the network and the price never changes.
       </p>
     </Shell>
   );
@@ -414,14 +607,16 @@ function Shell({ children }: { children: React.ReactNode }) {
 }
 
 function WalletChooser({
-  available,
+  probes,
   busyWallet,
   onConnect,
 }: {
-  available: Record<string, boolean> | null;
+  probes: WalletProbe[] | null;
   busyWallet: WalletId | null;
   onConnect: (wallet: WalletId) => void;
 }) {
+  const noneUsable = probes !== null && probes.every((probe) => !probe.usable);
+
   return (
     <div>
       <p className="text-[14px] font-semibold">Connect a wallet to pay.</p>
@@ -430,34 +625,36 @@ function WalletChooser({
       </p>
 
       <div className="mt-3.5 space-y-2">
-        {WALLETS.map((wallet) => {
-          const installed = available?.[wallet.id] ?? false;
-          const unknown = available === null;
-          return (
-            <button
-              key={wallet.id}
-              type="button"
-              onClick={() => void onConnect(wallet.id)}
-              disabled={unknown || !installed || busyWallet !== null}
-              className="wallet-button flex w-full items-center justify-between px-3.5 py-3 text-left"
-            >
-              <span>
-                <span className="block text-[14px] font-semibold">{wallet.name}</span>
-                <span className="block text-[11.5px] text-[var(--ink-muted)]">
-                  {unknown
-                    ? "Checking…"
-                    : installed
-                      ? wallet.blurb
-                      : "Not detected in this browser"}
-                </span>
-              </span>
-              <span className="text-[12.5px] font-semibold text-[var(--color-copper)]">
-                {busyWallet === wallet.id ? "Connecting…" : installed ? "Connect" : ""}
-              </span>
-            </button>
-          );
-        })}
+        {(probes ?? []).map((probe) => (
+          <button
+            key={probe.id}
+            type="button"
+            onClick={() => void onConnect(probe.id)}
+            disabled={!probe.usable || busyWallet !== null}
+            className="wallet-button flex w-full items-center justify-between px-3.5 py-3 text-left"
+          >
+            <span className="min-w-0">
+              <span className="block text-[14px] font-semibold">{probe.name}</span>
+              <span className="block text-[11.5px] text-[var(--ink-muted)]">{probe.detail}</span>
+            </span>
+            <span className="shrink-0 text-[12.5px] font-semibold text-[var(--color-copper)]">
+              {busyWallet === probe.id ? "Connecting…" : probe.usable ? "Connect" : ""}
+            </span>
+          </button>
+        ))}
+
+        {probes === null && (
+          <p className="text-[12.5px] text-[var(--ink-muted)]">Checking which wallets are here…</p>
+        )}
       </div>
+
+      {noneUsable && (
+        <p className="mt-3 text-[11.5px] leading-relaxed text-[var(--ink-faint)]">
+          Neither wallet is reachable from this browser. Freighter and LOBSTR sign here through
+          their desktop extensions — from a phone, open the link in a desktop browser, or use the
+          wallet that holds the address you want to pay from.
+        </p>
+      )}
     </div>
   );
 }
@@ -468,7 +665,6 @@ function ConnectedView({
   quotes,
   selected,
   onSelect,
-  phase,
   missingAccount,
   destAmount,
 }: {
@@ -477,7 +673,6 @@ function ConnectedView({
   quotes: Map<string, Quote>;
   selected: string | null;
   onSelect: (key: string) => void;
-  phase: Phase;
   missingAccount: boolean;
   destAmount: number;
 }) {
@@ -497,9 +692,7 @@ function ConnectedView({
         >
           Fund it with testnet XLM →
         </a>
-        <p className="mt-2 text-[11.5px] text-[var(--ink-faint)]">
-          Then reload this page.
-        </p>
+        <p className="mt-2 text-[11.5px] text-[var(--ink-faint)]">Then reload this page.</p>
       </div>
     );
   }
@@ -576,6 +769,237 @@ function ConnectedView({
           );
         })}
       </ul>
+
+      {!account.hasUsdc && (
+        <p className="mt-2.5 text-[11.5px] leading-relaxed text-[var(--ink-faint)]">
+          This wallet has no USDC trustline yet. The payment adds one in the same transaction, so
+          it is still a single confirmation.
+        </p>
+      )}
+    </div>
+  );
+}
+
+/**
+ * The lock, in exactly three states. Everything shown here is read back off the
+ * ledger, so two different people opening the same claim id see the same thing.
+ */
+function LockView({
+  lock,
+  request,
+  claimId,
+  destAmount,
+  connection,
+  probes,
+  busyWallet,
+  onConnect,
+  onTake,
+  onRefresh,
+  busy,
+  error,
+}: {
+  lock: LockState;
+  request: PayRequest;
+  claimId: string;
+  destAmount: number;
+  connection: Connected | null;
+  probes: WalletProbe[] | null;
+  busyWallet: WalletId | null;
+  onConnect: (wallet: WalletId) => void;
+  onTake: () => void;
+  onRefresh: () => void;
+  busy: boolean;
+  error: string | null;
+}) {
+  const amount = lock.amount ?? destAmount;
+  const isFreelancer = connection !== null && connection.address === lock.destination;
+  const isFunder = connection !== null && connection.address === lock.funder;
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const expired = lock.deadline !== null && nowSeconds >= lock.deadline;
+
+  const label =
+    lock.status === "waiting" ? "Waiting" : lock.status === "paid" ? "Paid" : "Returned";
+  const dot =
+    lock.status === "paid"
+      ? "bg-[var(--color-olive)]"
+      : lock.status === "returned"
+        ? "bg-[var(--color-copper)]"
+        : "bg-[var(--color-amber)]";
+
+  return (
+    <>
+      <section className="mt-10">
+        <div className="flex items-center gap-2">
+          <span className={`inline-block h-2 w-2 rounded-full ${dot}`} />
+          <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-[var(--ink-muted)]">
+            {label}
+          </p>
+        </div>
+
+        <div className="price mt-2.5">
+          {formatUsdc(amount)}
+          <span className="price-unit">USDC</span>
+        </div>
+
+        {request.note && (
+          <p className="mt-3 max-w-[26rem] text-[14px] leading-relaxed text-[var(--ink-muted)]">
+            {request.note}
+          </p>
+        )}
+      </section>
+
+      <section className="card fade-in mt-7 p-4">
+        {lock.status === "waiting" && (
+          <p className="text-[14.5px] leading-relaxed">
+            <span className="font-semibold tabular-nums">{formatAmount(amount)} USDC</span> is locked
+            on Stellar for{" "}
+            <span className="mono text-[13px]">{shortAddress(lock.destination ?? request.to, 5, 5)}</span>
+            . It is theirs to claim.
+          </p>
+        )}
+
+        {lock.status === "paid" && (
+          <p className="text-[14.5px] leading-relaxed">
+            <span className="font-semibold tabular-nums">{formatAmount(amount)} USDC</span> was
+            claimed by{" "}
+            <span className="mono text-[13px]">{shortAddress(lock.claimedBy ?? "", 5, 5)}</span>. The
+            payment is settled.
+          </p>
+        )}
+
+        {lock.status === "returned" && (
+          <p className="text-[14.5px] leading-relaxed">
+            The deadline passed without a claim, so{" "}
+            <span className="font-semibold tabular-nums">{formatAmount(amount)} USDC</span> went back
+            to{" "}
+            <span className="mono text-[13px]">{shortAddress(lock.funder ?? "", 5, 5)}</span>.
+          </p>
+        )}
+
+        {lock.deadline !== null && lock.status === "waiting" && (
+          <p className="mt-2 text-[12.5px] leading-relaxed text-[var(--ink-muted)]">
+            {expired
+              ? `The hold expired ${formatWhen(lock.deadline * 1000)}. The client can take it back.`
+              : `If it is not claimed by ${formatWhen(lock.deadline * 1000)}, the client can take it back.`}
+          </p>
+        )}
+
+        {/* Whoever the connected wallet is decides which action is even offered. */}
+        <div className="mt-4">
+          {connection === null ? (
+            <>
+              <p className="mb-2 text-[12.5px] leading-relaxed text-[var(--ink-muted)]">
+                Connect the wallet this concerns to act on it.
+              </p>
+              <WalletChooser probes={probes} busyWallet={busyWallet} onConnect={onConnect} />
+            </>
+          ) : isFreelancer && lock.status === "waiting" ? (
+            <button
+              type="button"
+              onClick={onTake}
+              disabled={busy}
+              className="pay-button w-full rounded-[10px] px-4 py-3.5 text-[15.5px]"
+            >
+              {busy ? "Claiming…" : `Claim ${formatUsdc(amount)} USDC`}
+            </button>
+          ) : isFunder && lock.status === "waiting" && expired ? (
+            <button
+              type="button"
+              onClick={onTake}
+              disabled={busy}
+              className="pay-button w-full rounded-[10px] px-4 py-3.5 text-[15.5px]"
+            >
+              {busy ? "Taking it back…" : `Take back ${formatUsdc(amount)} USDC`}
+            </button>
+          ) : (
+            <p className="text-[12.5px] leading-relaxed text-[var(--ink-muted)]">
+              {lock.status === "waiting"
+                ? isFunder
+                  ? "The hold has not expired yet."
+                  : `This wallet is not the one the lock was made for.`
+                : "This lock has already been settled."}
+            </p>
+          )}
+
+          {error && (
+            <p className="mt-2 text-[12.5px] leading-relaxed text-[var(--color-copper)]">{error}</p>
+          )}
+        </div>
+
+        <div className="rule my-4" />
+
+        <p className="text-[11px] font-semibold uppercase tracking-[0.13em] text-[var(--ink-muted)]">
+          Claim id
+        </p>
+        <p className="mono mt-1.5 break-all text-[11px] text-[var(--ink-faint)]">{claimId}</p>
+        <p className="mt-1.5 text-[11.5px] leading-relaxed text-[var(--ink-muted)]">
+          Anyone can open this lock by pasting the claim id at the top of the site.
+        </p>
+
+        <div className="rule my-4" />
+
+        <LedgerTrail lock={lock} />
+
+        <button
+          type="button"
+          onClick={onRefresh}
+          disabled={busy}
+          className="mt-4 text-[12.5px] font-semibold text-[var(--color-copper)] underline decoration-[rgba(184,92,56,0.35)] underline-offset-2 disabled:opacity-50"
+        >
+          {busy ? "Checking…" : "Check the ledger again"}
+        </button>
+      </section>
+    </>
+  );
+}
+
+/**
+ * The three transactions a lock can produce. A lock that is still waiting has
+ * only the first; one that settled has two. What has not happened is shown as
+ * not having happened rather than dressed up.
+ */
+function LedgerTrail({ lock }: { lock: LockState }) {
+  const steps: { label: string; detail: string; hash: string | null }[] = [
+    { label: "Lock", detail: "the payment swapped into USDC and held", hash: lock.lockHash },
+    {
+      label: "Pay",
+      detail: "the payee claimed it",
+      hash: lock.status === "paid" ? lock.claimHash : null,
+    },
+    {
+      label: "Return",
+      detail: "it went back unclaimed",
+      hash: lock.status === "returned" ? lock.claimHash : null,
+    },
+  ];
+
+  return (
+    <div>
+      <p className="text-[11px] font-semibold uppercase tracking-[0.13em] text-[var(--ink-muted)]">
+        On the ledger
+      </p>
+      <ul className="mt-2 space-y-2">
+        {steps.map((step) => (
+          <li key={step.label} className="flex items-baseline justify-between gap-3">
+            <span className="min-w-0">
+              <span className="block text-[12.5px] font-semibold">{step.label}</span>
+              <span className="block text-[11.5px] text-[var(--ink-muted)]">{step.detail}</span>
+            </span>
+            {step.hash ? (
+              <a
+                href={`${EXPLORER_URL}/tx/${step.hash}`}
+                target="_blank"
+                rel="noreferrer"
+                className="mono shrink-0 text-[11px] font-semibold text-[var(--color-copper)] underline decoration-[rgba(184,92,56,0.35)] underline-offset-2"
+              >
+                {step.hash.slice(0, 8)}…
+              </a>
+            ) : (
+              <span className="shrink-0 text-[11.5px] text-[var(--ink-faint)]">not yet</span>
+            )}
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }
@@ -601,9 +1025,7 @@ function PaidCard({
       </div>
 
       <p className="mt-3 text-[15px] leading-relaxed">
-        <span className="font-semibold tabular-nums">
-          {formatAmount(delivered)} USDC
-        </span>{" "}
+        <span className="font-semibold tabular-nums">{formatAmount(delivered)} USDC</span>{" "}
         <span className="text-[var(--ink-muted)]">delivered to</span>{" "}
         <span className="mono text-[13px]">{shortAddress(request.to, 5, 5)}</span>
       </p>

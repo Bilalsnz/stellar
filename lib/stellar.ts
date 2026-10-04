@@ -2,6 +2,7 @@ import {
   Account,
   Asset,
   BASE_FEE,
+  Claimant,
   Horizon,
   Networks,
   Operation,
@@ -67,6 +68,12 @@ export interface AccountState {
   /** Base reserve + subentries + fee buffer, in XLM. Zero for non-native views. */
   minXlmReserve: number;
   held: HeldAsset[];
+  /**
+   * Whether the account has a USDC trustline at all. This cannot be read off
+   * `held`: that list is filtered to positive balances, and a trustline that has
+   * been opened but never funded holds exactly zero.
+   */
+  hasUsdc: boolean;
 }
 
 /**
@@ -101,7 +108,19 @@ export async function loadAccount(address: string): Promise<AccountState> {
   const reserve = minXlmReserve(account.subentry_count ?? 0);
 
   const held: HeldAsset[] = [];
+  let hasUsdc = false;
+
   for (const line of account.balances) {
+    // Checked before the balance filter below, so an opened-but-empty trustline
+    // still counts as one.
+    if (
+      (line.asset_type === "credit_alphanum4" || line.asset_type === "credit_alphanum12") &&
+      line.asset_code === "USDC" &&
+      (line as { asset_issuer?: string }).asset_issuer === USDC_ISSUER
+    ) {
+      hasUsdc = true;
+    }
+
     const asset = assetFromBalance(line);
     if (!asset) continue;
 
@@ -125,7 +144,7 @@ export async function loadAccount(address: string): Promise<AccountState> {
   // Native first — it is what a testnet wallet almost always has.
   held.sort((a, b) => (a.isNative === b.isNative ? b.balance - a.balance : a.isNative ? -1 : 1));
 
-  return { address, minXlmReserve: reserve, held };
+  return { address, minXlmReserve: reserve, held, hasUsdc };
 }
 
 export interface Quote {
@@ -258,6 +277,231 @@ export function buildTrustline(address: string, sequence: string): Transaction {
     .addOperation(Operation.changeTrust({ asset: USDC }))
     .setTimeout(180)
     .build();
+}
+
+/* ------------------------------------------------------------------------- *
+ * The lock
+ *
+ * The price is not paid straight across. The client's transaction swaps
+ * whatever they hold into USDC and then locks that exact amount in a claimable
+ * balance destined to the freelancer, releasable back to the client after a
+ * deadline the freelancer set. The freelancer claims it to be paid; if they
+ * never do, the client takes it back.
+ *
+ * The lock is funded by the client, and it has to be: a claimable balance is
+ * paid for out of its creator's own balance, and a freelancer setting up a link
+ * holds no USDC — often not even a trustline. Naming a claimant costs nothing,
+ * which is exactly why an account that cannot yet receive USDC can still be
+ * paid this way.
+ * ------------------------------------------------------------------------- */
+
+export interface LockedPaymentPlan {
+  /** The client. Funds the lock, and may reclaim it once the deadline passes. */
+  sourceAddress: string;
+  /** The freelancer. Claims the lock to be paid. */
+  destination: string;
+  sendAsset: Asset;
+  sendMax: string;
+  /** Exactly the price, in USDC. */
+  destAmount: string;
+  path: Asset[];
+  /** Unix seconds. At or after this the client may reclaim. */
+  deadline: number;
+  /** The client has no USDC trustline yet and needs one to hold the swap. */
+  addTrustline: boolean;
+}
+
+export interface BuiltLock {
+  transaction: Transaction;
+  /** Known before submitting — it derives from the transaction itself. */
+  claimId: string;
+}
+
+/**
+ * One transaction performs the whole payment: the path payment swaps the
+ * client's asset into USDC **in their own account**, and the next operation
+ * locks that exact USDC for the freelancer. Stellar applies the operations
+ * atomically, so the swap cannot happen without the lock.
+ */
+export function buildLockedPayment(plan: LockedPaymentPlan, sequence: string): BuiltLock {
+  const account = new Account(plan.sourceAddress, sequence);
+  const builder = new TransactionBuilder(account, {
+    fee: BASE_FEE,
+    networkPassphrase: NETWORK_PASSPHRASE,
+  });
+
+  // The swap credits the client with USDC for the instant before it is locked,
+  // so the client needs the trustline too — not only the freelancer.
+  if (plan.addTrustline) {
+    builder.addOperation(Operation.changeTrust({ asset: USDC }));
+  }
+
+  builder.addOperation(
+    Operation.pathPaymentStrictReceive({
+      sendAsset: plan.sendAsset,
+      sendMax: plan.sendMax,
+      destination: plan.sourceAddress,
+      destAsset: USDC,
+      destAmount: plan.destAmount,
+      path: plan.path,
+    }),
+  );
+
+  const lockIndex = plan.addTrustline ? 2 : 1;
+
+  builder.addOperation(
+    Operation.createClaimableBalance({
+      asset: USDC,
+      amount: plan.destAmount,
+      claimants: [
+        new Claimant(plan.destination),
+        new Claimant(
+          plan.sourceAddress,
+          Claimant.predicateNot(Claimant.predicateBeforeAbsoluteTime(String(plan.deadline))),
+        ),
+      ],
+    }),
+  );
+
+  const transaction = builder.setTimeout(180).build();
+  return { transaction, claimId: transaction.getClaimableBalanceId(lockIndex) };
+}
+
+/**
+ * Take a locked balance. The freelancer being paid and the client reclaiming an
+ * expired lock are the same operation: the signer's address selects which
+ * claimant they are, and the predicates decide whether it is allowed yet.
+ */
+export function buildClaim(claimId: string, claimant: string, sequence: string): Transaction {
+  const account = new Account(claimant, sequence);
+  return new TransactionBuilder(account, {
+    fee: BASE_FEE,
+    networkPassphrase: NETWORK_PASSPHRASE,
+  })
+    .addOperation(Operation.claimClaimableBalance({ balanceId: claimId }))
+    .setTimeout(180)
+    .build();
+}
+
+export type LockStatus = "waiting" | "paid" | "returned";
+
+export interface LockState {
+  status: LockStatus;
+  /** USDC the lock holds, or held. `null` when the id is not on the ledger. */
+  amount: number | null;
+  /** The freelancer the lock was destined to. */
+  destination: string | null;
+  /** The client whose payment funded it. */
+  funder: string | null;
+  /** Unix seconds after which the client may reclaim. */
+  deadline: number | null;
+  /** Who actually took it, once it has been taken. */
+  claimedBy: string | null;
+  /** The transaction that created the lock — the payment itself. */
+  lockHash: string | null;
+  /** The transaction that took it out again, whichever way it went. */
+  claimHash: string | null;
+}
+
+type LockOp = {
+  type: string;
+  source_account?: string;
+  amount?: string;
+  transaction_hash?: string;
+  claimants?: { destination: string; predicate: Record<string, unknown> }[];
+};
+
+/** Horizon spells this predicate `{ not: { abs_before_epoch } }`. */
+function deadlineFromPredicate(predicate: Record<string, unknown> | undefined): number | null {
+  const not = (predicate as { not?: { abs_before_epoch?: string } } | undefined)?.not;
+  const epoch = not?.abs_before_epoch;
+  return epoch ? Number(epoch) : null;
+}
+
+/**
+ * Follow a lock through its whole life by reading the ledger. Horizon keeps a
+ * balance's operation history even after the balance itself is claimed and
+ * deleted, so this needs no database and assumes nothing from what this browser
+ * happens to remember. An id with no create operation reads as `waiting` with a
+ * null amount, which is how the page knows it is not on the ledger at all.
+ */
+export async function readLock(claimId: string): Promise<LockState> {
+  const unknown: LockState = {
+    status: "waiting",
+    amount: null,
+    destination: null,
+    funder: null,
+    deadline: null,
+    claimedBy: null,
+    lockHash: null,
+    claimHash: null,
+  };
+
+  let ops: LockOp[];
+  try {
+    const page = await server.operations().forClaimableBalance(claimId).call();
+    ops = page.records as unknown as LockOp[];
+  } catch {
+    return unknown;
+  }
+
+  const created = ops.find((op) => op.type === "create_claimable_balance");
+  if (!created) return unknown;
+
+  const amount = created.amount ? Number(created.amount) : null;
+  const funder = created.source_account ?? null;
+
+  // Both claimants are read by address rather than by position: the freelancer
+  // is the one the lock pays, and the deadline belongs to the one who funded it.
+  const claimants = created.claimants ?? [];
+  const destination =
+    claimants.find((claimant) => claimant.destination !== funder)?.destination ??
+    claimants[0]?.destination ??
+    null;
+  const deadline = deadlineFromPredicate(
+    (claimants.find((claimant) => claimant.destination === funder) ?? claimants[1])?.predicate,
+  );
+  const lockHash = created.transaction_hash ?? null;
+
+  const claimed = ops.find((op) => op.type === "claim_claimable_balance");
+  if (!claimed) {
+    return {
+      status: "waiting",
+      amount,
+      destination,
+      funder,
+      deadline,
+      claimedBy: null,
+      lockHash,
+      claimHash: null,
+    };
+  }
+
+  const claimedBy = claimed.source_account ?? null;
+  // The freelancer taking it is the payment landing; the client taking it back
+  // is the lock expiring unclaimed. Whoever signed the claim tells them apart.
+  const status: LockStatus = destination && claimedBy === destination ? "paid" : "returned";
+
+  return {
+    status,
+    amount,
+    destination,
+    funder,
+    deadline,
+    claimedBy,
+    lockHash,
+    claimHash: claimed.transaction_hash ?? null,
+  };
+}
+
+/** Every lock still standing for a freelancer. Used instead of a database. */
+export async function listOpenLocks(destination: string): Promise<string[]> {
+  try {
+    const page = await server.claimableBalances().claimant(destination).limit(50).call();
+    return page.records.map((record) => record.id);
+  } catch {
+    return [];
+  }
 }
 
 export async function nextSequence(address: string): Promise<string> {

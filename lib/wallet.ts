@@ -8,6 +8,23 @@ import { NETWORK_PASSPHRASE } from "./stellar";
  *
  * Both SDKs are imported lazily so nothing touches `window` while the page is
  * being rendered on the server.
+ *
+ * ## Why every call here is bounded
+ *
+ * Both SDKs speak to their extension over `window.postMessage` and resolve when
+ * a reply comes back. Neither one ever rejects when there is no extension to
+ * answer, and only *some* of their message types carry a timeout of their own:
+ *
+ *   isConnected()      — settles after ~2s with `false`
+ *   requestAccess()    — never settles          (Freighter)
+ *   getPublicKey()     — never settles          (LOBSTR)
+ *   signTransaction()  — never settles          (both)
+ *
+ * So the one call a page makes to *check* a wallet politely gives up, and the
+ * very next call — the one that actually connects — hangs for good. On a phone
+ * that is what an endless "Connecting…" is. Nothing below is allowed to wait
+ * forever: detection gives up fast, and connecting and signing have real
+ * ceilings that turn into a sentence the user can read.
  */
 
 export type WalletId = "freighter" | "lobstr";
@@ -23,10 +40,33 @@ export const WALLETS: WalletOption[] = [
   { id: "lobstr", name: "LOBSTR", blurb: "Browser extension" },
 ];
 
+/**
+ * Detection is a yes/no question about this browser, so it must not be allowed
+ * to take longer than a glance. This is the ceiling the page waits before it
+ * decides a wallet is not reachable.
+ */
+const DETECT_TIMEOUT_MS = 2000;
+
+/** Long enough to unlock a wallet and approve, short enough to be an answer. */
+const CONNECT_TIMEOUT_MS = 30_000;
+
+/** Signing a payment is deliberate, so it is given more room than connecting. */
+const SIGN_TIMEOUT_MS = 90_000;
+
 export interface Connection {
   address: string;
   /** Set when the wallet is reachable but pointed at another network. */
   warning?: string;
+}
+
+/** One line each about where a wallet stands in *this* browser. */
+export interface WalletProbe {
+  id: WalletId;
+  name: string;
+  /** A sign path is genuinely reachable from this page right now. */
+  usable: boolean;
+  /** Said plainly, so a button that cannot work never looks like it might. */
+  detail: string;
 }
 
 function messageOf(error: unknown, fallback: string): string {
@@ -41,6 +81,23 @@ function messageOf(error: unknown, fallback: string): string {
   return fallback;
 }
 
+/** Reject rather than hang. The SDKs will not do this for us. */
+function withTimeout<T>(work: Promise<T>, ms: number, message: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(message)), ms);
+    work.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
 async function freighter() {
   return import("@stellar/freighter-api");
 }
@@ -49,25 +106,106 @@ async function lobstr() {
   return import("@lobstrco/signer-extension-api");
 }
 
-export async function isAvailable(id: WalletId): Promise<boolean> {
+/**
+ * Freighter's mobile app runs dapps in its own browser, but it injects only a
+ * marker saying who it is — not the extension API. A page there can detect the
+ * situation and say something true, but it cannot sign.
+ */
+function inFreighterApp(): boolean {
+  if (typeof window === "undefined") return false;
+  const injected = (window as { stellar?: { provider?: string; platform?: string } }).stellar;
+  return injected?.provider === "freighter" && injected?.platform === "mobile";
+}
+
+function hasFreighterExtension(): boolean {
+  if (typeof window === "undefined") return false;
+  return Boolean((window as { freighter?: unknown }).freighter);
+}
+
+function hasLobstrExtension(): boolean {
+  if (typeof window === "undefined") return false;
+  return Boolean((window as { lobstrSignerExtension?: unknown }).lobstrSignerExtension);
+}
+
+export function walletName(id: WalletId): string {
+  return WALLETS.find((wallet) => wallet.id === id)?.name ?? id;
+}
+
+/**
+ * Ask each wallet where it stands. Freighter is answered outright when it is
+ * installed; LOBSTR's `isConnected` is asked only because it is the one call
+ * that reliably gives up on its own, and it is bounded here regardless.
+ */
+export async function probeWallet(id: WalletId): Promise<WalletProbe> {
+  const name = walletName(id);
+
+  if (id === "freighter" && inFreighterApp()) {
+    return {
+      id,
+      name,
+      usable: false,
+      detail: "You are in the Freighter app, which cannot sign for a web page. Open this link in Safari or Chrome.",
+    };
+  }
+
+  let usable = false;
   try {
     if (id === "freighter") {
-      const api = await freighter();
-      const result = await api.isConnected();
-      return Boolean(result?.isConnected);
+      usable = hasFreighterExtension();
+      if (!usable) {
+        const api = await freighter();
+        const result = await withTimeout(api.isConnected(), DETECT_TIMEOUT_MS, "no answer");
+        usable = Boolean(result?.isConnected);
+      }
+    } else {
+      usable = hasLobstrExtension();
+      if (!usable) {
+        const api = await lobstr();
+        usable = Boolean(await withTimeout(api.isConnected(), DETECT_TIMEOUT_MS, "no answer"));
+      }
     }
-    const api = await lobstr();
-    return Boolean(await api.isConnected());
   } catch {
-    return false;
+    usable = false;
+  }
+
+  return {
+    id,
+    name,
+    usable,
+    detail: usable ? "Browser extension" : "Not installed in this browser",
+  };
+}
+
+export async function probeAll(): Promise<WalletProbe[]> {
+  return Promise.all(WALLETS.map((wallet) => probeWallet(wallet.id)));
+}
+
+/**
+ * Refuse up front, in the caller's own frame of reference, when there is
+ * nothing here that could possibly answer. Whether the extension has injected
+ * its flag yet is `probeWallet`'s question — and the call below is bounded
+ * either way, so a late injection cannot turn into a hang.
+ */
+function assertReachable(id: WalletId): void {
+  if (id === "freighter" && inFreighterApp()) {
+    throw new Error(
+      "The Freighter app cannot sign for a web page. Open this link in Safari or Chrome, where the Freighter extension can.",
+    );
   }
 }
 
 export async function connect(id: WalletId): Promise<Connection> {
+  assertReachable(id);
+  const name = walletName(id);
+
   if (id === "freighter") {
     const api = await freighter();
 
-    const result = await api.requestAccess();
+    const result = await withTimeout(
+      api.requestAccess(),
+      CONNECT_TIMEOUT_MS,
+      `${name} did not answer. Make sure the extension is installed and unlocked, then try again.`,
+    );
     if (result?.error) {
       throw new Error(messageOf(result.error, "Freighter refused the connection."));
     }
@@ -79,7 +217,7 @@ export async function connect(id: WalletId): Promise<Connection> {
     // public network would produce a transaction testnet cannot accept.
     let warning: string | undefined;
     try {
-      const network = await api.getNetwork();
+      const network = await withTimeout(api.getNetwork(), DETECT_TIMEOUT_MS, "no answer");
       if (network?.networkPassphrase && network.networkPassphrase !== NETWORK_PASSPHRASE) {
         warning = `Freighter is set to ${network.network || "another network"}. Switch it to Testnet.`;
       }
@@ -91,7 +229,11 @@ export async function connect(id: WalletId): Promise<Connection> {
   }
 
   const api = await lobstr();
-  const address = await api.getPublicKey();
+  const address = await withTimeout(
+    api.getPublicKey(),
+    CONNECT_TIMEOUT_MS,
+    `${name} did not answer. Make sure the extension is installed and unlocked, then try again.`,
+  );
   if (!address) {
     throw new Error("LOBSTR did not return an address. Unlock it and try again.");
   }
@@ -101,9 +243,15 @@ export async function connect(id: WalletId): Promise<Connection> {
 }
 
 export async function sign(id: WalletId, xdr: string): Promise<string> {
+  const name = walletName(id);
+
   if (id === "freighter") {
     const api = await freighter();
-    const result = await api.signTransaction(xdr, { networkPassphrase: NETWORK_PASSPHRASE });
+    const result = await withTimeout(
+      api.signTransaction(xdr, { networkPassphrase: NETWORK_PASSPHRASE }),
+      SIGN_TIMEOUT_MS,
+      `${name} did not answer. The transaction was not signed and nothing was sent.`,
+    );
     if (result?.error) {
       throw new Error(messageOf(result.error, "Freighter did not sign the transaction."));
     }
@@ -114,13 +262,13 @@ export async function sign(id: WalletId, xdr: string): Promise<string> {
   }
 
   const api = await lobstr();
-  const signed = await api.signTransaction(xdr);
+  const signed = await withTimeout(
+    api.signTransaction(xdr),
+    SIGN_TIMEOUT_MS,
+    `${name} did not answer. The transaction was not signed and nothing was sent.`,
+  );
   if (!signed) {
     throw new Error("LOBSTR returned nothing to submit.");
   }
   return signed;
-}
-
-export function walletName(id: WalletId): string {
-  return WALLETS.find((wallet) => wallet.id === id)?.name ?? id;
 }
