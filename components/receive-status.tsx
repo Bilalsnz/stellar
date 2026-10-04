@@ -12,6 +12,8 @@ import {
   type DestinationCheck,
 } from "@/lib/stellar";
 import { connect, probeAll, sign, type WalletId, type WalletProbe } from "@/lib/wallet";
+import { clearWalletConnectUri } from "@/lib/walletconnect";
+import { WalletConnectPanel } from "./walletconnect-panel";
 
 /**
  * The freelancer cannot be paid USDC until their own account exists on testnet
@@ -20,15 +22,33 @@ import { connect, probeAll, sign, type WalletId, type WalletProbe } from "@/lib/
  *
  * The buttons here are only offered for wallets that can actually answer in
  * this browser. Asking a wallet that is not there does not fail — it hangs —
- * so an ungated button is a button that spins forever.
+ * so an ungated button is a button that spins forever. Freighter over
+ * WalletConnect needs nothing injected, so from a phone it is the one that is
+ * always there.
  */
 type SetupState =
   | { kind: "idle" }
   | { kind: "connecting"; wallet: WalletId }
   | { kind: "signing"; wallet: WalletId }
   | { kind: "submitting" }
+  | { kind: "confirming" }
   | { kind: "done" }
   | { kind: "error"; message: string };
+
+/**
+ * Horizon ingests a ledger a moment after it closes, so a trustline can be
+ * signed, submitted and accepted while the account still reads as having none.
+ * Asking once and believing the answer is how a warning survives the step that
+ * fixed it — so ask until it agrees, then stop.
+ */
+async function confirmTrustline(address: string, tries = 12): Promise<DestinationCheck> {
+  let state = await checkDestination(address);
+  for (let attempt = 1; attempt < tries && state.kind !== "ok"; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    state = await checkDestination(address);
+  }
+  return state;
+}
 
 export function ReceiveStatus({
   address,
@@ -82,6 +102,8 @@ export function ReceiveStatus({
   const addTrustline = async (wallet: WalletId) => {
     setBusyWallet(wallet);
     setSetup({ kind: "connecting", wallet });
+    // Switching wallets must not leave the previous pairing code on screen.
+    clearWalletConnectUri();
     try {
       const connection = await connect(wallet);
 
@@ -108,8 +130,11 @@ export function ReceiveStatus({
         return;
       }
 
+      // The warning has to clear itself. Waiting for the network to see the
+      // trustline is the whole of that job — there is no reload to fall back on.
+      setSetup({ kind: "confirming" });
+      setCheck(await confirmTrustline(address.trim()));
       setSetup({ kind: "done" });
-      await runCheck(address.trim());
     } catch (error) {
       setSetup({
         kind: "error",
@@ -117,6 +142,7 @@ export function ReceiveStatus({
       });
     } finally {
       setBusyWallet(null);
+      clearWalletConnectUri();
     }
   };
 
@@ -146,8 +172,6 @@ export function ReceiveStatus({
   if (check.kind === "invalid" || check.kind === "unknown") {
     return <p className="text-[13px] text-[var(--ink-muted)]">{check.message}</p>;
   }
-
-  const noneUsable = probes !== null && probes.every((probe) => !probe.usable);
 
   return (
     <div className="no-path px-3.5 py-3 text-[13px] leading-relaxed">
@@ -203,18 +227,18 @@ export function ReceiveStatus({
                 })}
               </div>
 
-              {noneUsable && (
-                <p className="mt-2 text-[11.5px] leading-relaxed text-[var(--ink-muted)]">
-                  The trustline has to be signed by the wallet that holds this address, so it
-                  needs a browser where that wallet can sign — the desktop extension, or the
-                  wallet&rsquo;s own app. There is nothing this page can sign on your behalf.
-                </p>
-              )}
+              {/* The pairing code, while the relay waits for Freighter. */}
+              <WalletConnectPanel />
             </>
           )}
 
           {setup.kind === "submitting" && (
             <p className="mt-2 text-[12.5px] text-[var(--ink-muted)]">Submitting the trustline…</p>
+          )}
+          {setup.kind === "confirming" && (
+            <p className="mt-2 text-[12.5px] text-[var(--ink-muted)]">
+              Waiting for the network to confirm it…
+            </p>
           )}
           {setup.kind === "done" && (
             <p className="mt-2 text-[12.5px] text-[var(--ink-muted)]">Trustline added.</p>

@@ -1,13 +1,15 @@
 import { NETWORK_PASSPHRASE } from "./stellar";
+import { connectWalletConnect, signWalletConnect } from "./walletconnect";
 
 /**
  * One small adapter per wallet, talking to each wallet's own official SDK.
  * We deliberately avoid the all-in-one wallet kits: they pull in WalletConnect,
  * Reown, Trezor and Ledger, and none of that is needed to sign a testnet
- * payment with the two wallets this page supports.
+ * payment with the two wallets this page supports — except WalletConnect itself,
+ * which is imported on its own below and is the one thing a phone actually needs.
  *
- * Both SDKs are imported lazily so nothing touches `window` while the page is
- * being rendered on the server.
+ * Both extension SDKs are imported lazily so nothing touches `window` while the
+ * page is being rendered on the server.
  *
  * ## Why every call here is bounded
  *
@@ -25,9 +27,16 @@ import { NETWORK_PASSPHRASE } from "./stellar";
  * that is what an endless "Connecting…" is. Nothing below is allowed to wait
  * forever: detection gives up fast, and connecting and signing have real
  * ceilings that turn into a sentence the user can read.
+ *
+ * ## The third option
+ *
+ * `walletconnect` is not an extension at all — it is Freighter on a phone, over
+ * a relay. It needs nothing injected, so it is always offered, and on a phone it
+ * is offered first. That is what stops "Not installed in this browser" from ever
+ * being the only thing a phone user sees.
  */
 
-export type WalletId = "freighter" | "lobstr";
+export type WalletId = "freighter" | "lobstr" | "walletconnect";
 
 export interface WalletOption {
   id: WalletId;
@@ -38,7 +47,25 @@ export interface WalletOption {
 export const WALLETS: WalletOption[] = [
   { id: "freighter", name: "Freighter", blurb: "Browser extension" },
   { id: "lobstr", name: "LOBSTR", blurb: "Browser extension" },
+  { id: "walletconnect", name: "Freighter on your phone", blurb: "WalletConnect" },
 ];
+
+/**
+ * A phone is the case this whole file is arranged around: it is the device where
+ * the extension cannot exist, so it is the device where the relay has to come
+ * first. iPadOS reports a desktop user agent, so touch points are the tell.
+ */
+export function isMobileBrowser(): boolean {
+  if (typeof navigator === "undefined") return false;
+  if (/Android|iPhone|iPod|iPad|Mobile|IEMobile|Opera Mini/i.test(navigator.userAgent)) {
+    return true;
+  }
+  return (
+    typeof navigator.maxTouchPoints === "number" &&
+    navigator.maxTouchPoints > 1 &&
+    /Macintosh/.test(navigator.userAgent)
+  );
+}
 
 /**
  * Detection is a yes/no question about this browser, so it must not be allowed
@@ -152,6 +179,21 @@ export function walletName(id: WalletId): string {
  */
 export async function probeWallet(id: WalletId): Promise<WalletProbe> {
   const name = walletName(id);
+
+  // WalletConnect asks a relay for a pairing code; there is no injected object
+  // to go looking for, so there is nothing here that can be missing. It is the
+  // one option that is always on the table.
+  if (id === "walletconnect") {
+    return {
+      id,
+      name,
+      usable: true,
+      detail: isMobileBrowser()
+        ? "Opens Freighter on this phone to approve"
+        : "Scan a code with Freighter on your phone",
+    };
+  }
+
   let usable = false;
 
   try {
@@ -180,8 +222,7 @@ export async function probeWallet(id: WalletId): Promise<WalletProbe> {
       id,
       name,
       usable: false,
-      detail:
-        "You are in the Freighter app, which cannot sign for a web page. Open this link in Safari or Chrome on a computer — Freighter signs for web pages over WalletConnect, which this page does not have.",
+      detail: "The Freighter app cannot sign for a web page — use Freighter on your phone below.",
     };
   }
 
@@ -193,8 +234,16 @@ export async function probeWallet(id: WalletId): Promise<WalletProbe> {
   };
 }
 
+/**
+ * On a phone the extension cannot exist, so the relay goes first; on a desktop
+ * the extension is less work — it signs without a second device — so it stays
+ * first and the relay is the fallback.
+ */
 export async function probeAll(): Promise<WalletProbe[]> {
-  return Promise.all(WALLETS.map((wallet) => probeWallet(wallet.id)));
+  const probes = await Promise.all(WALLETS.map((wallet) => probeWallet(wallet.id)));
+  const relay = probes.filter((probe) => probe.id === "walletconnect");
+  const extensions = probes.filter((probe) => probe.id !== "walletconnect");
+  return isMobileBrowser() ? [...relay, ...extensions] : [...extensions, ...relay];
 }
 
 /**
@@ -206,12 +255,23 @@ export async function probeAll(): Promise<WalletProbe[]> {
 function assertReachable(id: WalletId): void {
   if (id === "freighter" && !hasFreighterApi() && inFreighterApp()) {
     throw new Error(
-      "The Freighter app cannot sign for a web page. Open this link in Safari or Chrome, where the Freighter extension can.",
+      "The Freighter app cannot sign for a web page. Use Freighter on your phone instead — it works right here.",
     );
   }
 }
 
-export async function connect(id: WalletId): Promise<Connection> {
+/** The pairing code from a WalletConnect attempt, for the QR code on screen. */
+export interface ConnectOptions {
+  onUri?: (uri: string) => void;
+}
+
+export async function connect(id: WalletId, options: ConnectOptions = {}): Promise<Connection> {
+  if (id === "walletconnect") {
+    // No network warning is needed: the session is requested for testnet by
+    // chain id, so the wallet signs on the network this page is built for.
+    return { address: await connectWalletConnect(options.onUri) };
+  }
+
   assertReachable(id);
   const name = walletName(id);
 
@@ -260,6 +320,10 @@ export async function connect(id: WalletId): Promise<Connection> {
 }
 
 export async function sign(id: WalletId, xdr: string): Promise<string> {
+  if (id === "walletconnect") {
+    return signWalletConnect(xdr);
+  }
+
   const name = walletName(id);
 
   if (id === "freighter") {

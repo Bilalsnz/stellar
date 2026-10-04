@@ -12,7 +12,9 @@
     "@lobstrco/signer-extension-api": "^2.1.0",
     "@stellar/freighter-api": "^6.0.1",
     "@stellar/stellar-sdk": "^17.2.1",
+    "@walletconnect/universal-provider": "^2.25.0",
     "next": "^15.4.0",
+    "qrcode-generator": "^2.0.4",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },

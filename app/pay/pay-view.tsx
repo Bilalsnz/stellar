@@ -38,6 +38,8 @@ import {
   type WalletId,
   type WalletProbe,
 } from "@/lib/wallet";
+import { clearWalletConnectUri } from "@/lib/walletconnect";
+import { WalletConnectPanel } from "@/components/walletconnect-panel";
 
 /** How long a fresh lock stays open when the link did not say. */
 const DEFAULT_DEADLINE_DAYS = 7;
@@ -211,6 +213,8 @@ export function PayView() {
   const connectWallet = useCallback(async (wallet: WalletId) => {
     setBusyWallet(wallet);
     setError(null);
+    // Switching wallets must not leave the previous pairing code on screen.
+    clearWalletConnectUri();
     try {
       const result = await connect(wallet);
       setConnection({ ...result, wallet });
@@ -218,6 +222,7 @@ export function PayView() {
       setError(connectError instanceof Error ? connectError.message : "Could not connect.");
     } finally {
       setBusyWallet(null);
+      clearWalletConnectUri();
     }
   }, []);
 
@@ -615,8 +620,6 @@ function WalletChooser({
   busyWallet: WalletId | null;
   onConnect: (wallet: WalletId) => void;
 }) {
-  const noneUsable = probes !== null && probes.every((probe) => !probe.usable);
-
   return (
     <div>
       <p className="text-[14px] font-semibold">Connect a wallet to pay.</p>
@@ -648,13 +651,9 @@ function WalletChooser({
         )}
       </div>
 
-      {noneUsable && (
-        <p className="mt-3 text-[11.5px] leading-relaxed text-[var(--ink-faint)]">
-          Neither wallet is reachable from this browser. Freighter and LOBSTR sign here through
-          their desktop extensions — from a phone, open the link in a desktop browser, or use the
-          wallet that holds the address you want to pay from.
-        </p>
-      )}
+      {/* A phone gets the pairing code here: a QR on a desktop, a link into the
+          app on a phone. It stays until the wallet answers or the wait ends. */}
+      <WalletConnectPanel />
     </div>
   );
 }

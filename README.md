@@ -94,21 +94,36 @@ no server in the loop at all — the deployed app is fully static.
 
 - Next.js (App Router) + React + TypeScript, Tailwind v4, deployed on Vercel
 - `@stellar/stellar-sdk` for quoting, transaction building and submission
-- `@stellar/freighter-api` and `@lobstrco/signer-extension-api` for the two wallets
+- `@stellar/freighter-api` and `@lobstrco/signer-extension-api` for the two
+  browser extensions
+- `@walletconnect/universal-provider` for Freighter on a phone, and
+  `qrcode-generator` to draw the pairing code
 
-The wallets are talked to through their own official SDKs rather than an
+The extensions are talked to through their own official SDKs rather than an
 all-in-one wallet kit, which would pull in WalletConnect, Reown, Trezor and
-Ledger to sign a testnet payment.
+Ledger to sign a testnet payment. WalletConnect is imported on its own and
+lazily — it is a 496 kB chunk that only loads when someone actually chooses the
+phone option, so it costs the other visitors nothing.
 
-## Wallet support, and the mobile limit
+## Wallet support
 
-**Freighter** and **LOBSTR** browser extensions. Both sign a Stellar transaction
-the same way; each is probed independently and a wallet that cannot answer says
-so rather than offering a button that cannot work.
+There are three ways to sign, and they are not interchangeable:
 
-Both SDKs talk to their extension over `window.postMessage` and resolve when a
-reply arrives. Neither rejects when there is no extension to answer, and only
-*some* of their calls carry a timeout of their own:
+| option | works on | how |
+| --- | --- | --- |
+| **Freighter** | desktop | the browser extension |
+| **LOBSTR** | desktop | the browser extension |
+| **Freighter on your phone** | any phone, and desktop | WalletConnect |
+
+Each is probed before its button is offered, so a wallet that cannot answer is
+described rather than left as a button that spins. On a phone the WalletConnect
+option is listed **first**, because on a phone it is the only one that can work.
+
+### Why the extensions hang, and why nothing here does
+
+Both extension SDKs talk to their wallet over `window.postMessage` and resolve
+when a reply arrives. Neither rejects when there is no extension to answer, and
+only *some* of their calls carry a timeout of their own:
 
 | call | behaviour with no extension |
 | --- | --- |
@@ -119,40 +134,57 @@ reply arrives. Neither rejects when there is no extension to answer, and only
 
 So the one call a page makes to *check* a wallet politely gives up, and the next
 call — the one that connects — hangs for good. That is what an endless
-"Connecting…" is. Every call in `lib/wallet.ts` is therefore bounded: detection
-gives up after 2 seconds, connecting after 30, signing after 90, and each ceiling
-becomes a sentence rather than a spinner.
+"Connecting…" is. Every call is therefore bounded: detection gives up after 2
+seconds, connecting after 30, signing after 90, and each ceiling becomes a
+sentence rather than a spinner. The button stays where it was, and pressing it
+again works.
 
 **The injected provider is `window.freighterApi`**, with `window.freighter` as a
 legacy alias. Other wallets' in-app browsers (D'CENT, and the mobile browsers
 Stellar Wallets Kit probes for) inject that same Freighter interface, so a page
 that checks only the legacy name reports a working sign path as missing. HoldPay
 checks for the provider **first**, and only falls through to the mobile message
-when no provider answered — so a wallet browser that does inject the API stays
-usable.
+when no provider answered.
 
-**Inside the Freighter app on a phone**, no extension API is injected at all —
-Freighter sets only `window.stellar = { provider: "freighter", platform:
-"mobile" }`. That is detectable, so the page detects it and says plainly that the
-app cannot sign for a web page and the link should be opened in a browser where
-Freighter can sign. The trustline step is gated the same way, so it too fails
-with a sentence instead of hanging.
+### Freighter on a phone
 
-LOBSTR's in-app browser injects no documented API, so there is nothing to detect
-and nothing to call. Their signing flow runs through the *desktop* extension with
-confirmation pushed to the phone app. The page reports that no sign path is
-reachable here rather than offering a button that cannot work.
+Freighter's mobile app injects no extension API into a web page — it sets only
+`window.stellar = { provider: "freighter", platform: "mobile" }`. A page there
+can tell what it is, but it cannot `postMessage` to anything. The route Freighter
+supports on mobile is **WalletConnect**, and it needs nothing injected at all:
+the page asks a relay for a pairing code, and signing travels back over the
+relay.
 
-**Neither wallet offers an in-app-browser signing API.** Freighter's own docs
-state that mobile integration "works over WalletConnect v2" (`stellar_signXDR`,
-`stellar_signAndSubmitXDR`). Implementing that needs a Reown/WalletConnect
-project id, and its kit pulls in Reown, Trezor and Ledger — so rather than ship
-an untestable path that would also risk the deploy, HoldPay ships the bounded
-timeouts and says exactly what it cannot do.
+There is one thing a phone cannot do, and it decides the whole layout: **a phone
+cannot scan its own screen, and a desktop cannot open a phone app.** So the
+pairing code is offered both ways and the device picks — the app's deep link on a
+phone, a QR code on a desktop, and the raw code behind a disclosure for anything
+else.
 
-Both wallets must be set to **Testnet**. Freighter's network is read and a
+**There is no documented `freighter://` scheme, and Freighter's docs say not to
+invent one.** The real one is published in Freighter's own entry in the
+WalletConnect wallet registry, which is what the standard modal reads:
+
+```
+mobile.native = "freighterwallet://wc-redirect"
+```
+
+WalletConnect's convention is to append `?uri=<percent-encoded pairing code>`,
+the same way `metamask://wc?uri=…` is built. The same registry entry lists
+`chains: ["stellar:pubnet", "stellar:testnet"]`, which is where the chain id is
+confirmed rather than guessed.
+
+One trap worth writing down: whether that link joins with `?` or `&` has to be
+decided from the **base** URL. The pairing code always carries a query of its
+own — `…@2?relay-protocol=irn&symKey=…` — so testing the code for a `?` produces
+`freighterwallet://wc-redirect&uri=…`, a link with no query at all. That bug was
+written, caught by `scripts/probe-walletconnect.mjs`, and fixed.
+
+Both wallets must be **set to Testnet**. Freighter's network is read and a
 warning is shown when it is pointed elsewhere. LOBSTR exposes no network query,
-so the page asks the user to check rather than assuming.
+so the page asks the user to check rather than assuming. The WalletConnect
+session is requested for `stellar:testnet` by chain id, so that path needs no
+warning.
 
 ## Running it
 
@@ -199,6 +231,23 @@ candidate. Its results are the table in **The lock** above.
 node scripts/probe-freelancer-lock.mjs
 ```
 
+`scripts/probe-walletconnect.mjs` answers the other question a script *can*
+answer: can this page reach Freighter at all? There is exactly one thing no
+script can do — approve on a phone — so it drives the real `lib/walletconnect.ts`
+and stops at the moment a human would pick their phone up.
+
+```bash
+node node_modules/typescript/lib/tsc.js lib/walletconnect.ts \
+  --outDir .e2e-build --rootDir lib --module esnext --target es2022 \
+  --moduleResolution bundler --skipLibCheck
+node scripts/probe-walletconnect.mjs
+```
+
+It checks that the relay accepts the project id and opens a pairing topic, that
+the `stellar:testnet` namespace survives validation, that a pairing code is
+actually emitted, and that the deep link is well formed and round-trips. It does
+not prove a wallet approved, and it does not claim to.
+
 ## Receiving USDC
 
 A Stellar account cannot **hold** USDC without a trustline. The freelancer page
@@ -206,6 +255,16 @@ checks the address as it is typed and, when it is missing, offers the two steps
 that fix it — fund the account on testnet, then sign the USDC trustline with
 their own wallet. Both are ordinary Stellar operations; neither involves a
 contract.
+
+The trustline is signed by whichever of the three wallet options can sign for
+that address, including Freighter on a phone.
+
+**The warning clears itself.** Horizon ingests a ledger a moment after it closes,
+so a trustline can be signed, submitted and accepted while the account still
+reads as having none. Asking once and believing the answer is how a warning
+outlives the step that fixed it. The page therefore keeps asking until the
+network agrees — "Waiting for the network to confirm it…" — and then shows the
+address as ready. No reload, and no second look at a stale answer.
 
 The payment page performs the same check on the link's destination, so a client
 is told up front when a link cannot be paid instead of after signing.
